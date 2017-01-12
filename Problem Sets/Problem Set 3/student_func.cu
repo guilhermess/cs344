@@ -79,26 +79,139 @@
 
 */
 
+#include <device_launch_parameters.h>
+#include <iostream>
+#include <stdio.h>
 #include "utils.h"
+
+__global__ void reduce_min( const float * const values, size_t array_size, float *reduced)
+{
+  extern __shared__ float smem[];
+  int id = blockIdx.x * blockDim.x + threadIdx.x;
+  int tid = threadIdx.x;
+
+  if ( id < array_size )
+    smem[tid] = values[id];
+  __syncthreads();
+
+  for ( unsigned int s = blockDim.x / 2; s > 0; s >>= 1)
+  {
+    if ( tid < s && id+s < array_size )
+      smem[tid] = (smem[tid] - smem[tid+s] > -1e-15) ? smem[tid+s] : smem[tid];
+    else if ( tid < s )
+      smem[tid] = smem[tid];
+    __syncthreads();
+  }
+
+  if ( tid == 0 )
+    reduced[blockIdx.x] = smem[0];
+}
+
+__global__ void reduce_max( const float * const values, size_t size, float *reduced)
+{
+  extern __shared__ float smem[];
+  int id = blockIdx.x * blockDim.x + threadIdx.x;
+  int tid = threadIdx.x;
+
+  if ( id < size )
+    smem[tid] = values[id];
+  __syncthreads();
+
+  for ( unsigned int s = blockDim.x / 2; s > 0; s >>= 1)
+  {
+    if ( tid < s && id+s < size )
+      smem[tid] = (smem[tid] - smem[tid+s] > 1e-15) ? smem[tid] : smem[tid+s];
+    else if ( tid < s )
+      smem[tid] = smem[tid];
+    __syncthreads();
+  }
+
+  if ( tid == 0 )
+    reduced[blockIdx.x] = smem[0];
+}
+
+__global__ void histogram( const float *values, size_t size, unsigned int *bins, unsigned int num_bins, float min_val, float range )
+{
+  int id = blockIdx.x * blockDim.x + threadIdx.x;
+  if ( id < num_bins )
+    bins[id] = 0;
+  __syncthreads();
+
+  if ( id < size ) {
+    unsigned int bin = static_cast<unsigned int>((values[id] - min_val) / range * num_bins);
+    bin = (num_bins - 1 < bin ) ? num_bins - 1 : bin;
+    atomicAdd(&bins[bin], 1);
+  }
+}
+
+__global__ void exclusive_scan_add( const unsigned int * const values, unsigned int size, unsigned int * const output )
+{
+  extern __shared__ unsigned int exclusive_scan_smem[];
+  int id = blockIdx.x * blockDim.x + threadIdx.x;
+  int tid = threadIdx.x;
+
+  if ( id < size )
+    exclusive_scan_smem[tid] = values[id];
+  __syncthreads();
+
+  //Reduce
+  for ( unsigned int s = 1; s < size; s <<= 1 )
+  {
+    if ( (tid+1) % s == 0 && ((tid+1)/s) % 2 == 0)
+      exclusive_scan_smem[tid] = exclusive_scan_smem[tid] + exclusive_scan_smem[tid-s];
+    __syncthreads();
+  }
+
+  if (tid == size-1)
+    exclusive_scan_smem[tid] = 0;
+  __syncthreads();
+
+  //Downsweep
+  for ( unsigned int s = size; s >= 1; s >>= 1 )
+  {
+    if ( (tid+1) % s == 0 && ((tid+1)/s) % 2 == 0)
+    {
+      unsigned int tmp = exclusive_scan_smem[tid];
+      exclusive_scan_smem[tid] = exclusive_scan_smem[tid] + exclusive_scan_smem[tid - s];
+      exclusive_scan_smem[tid-s] = tmp;
+    }
+    __syncthreads();
+  }
+
+  if ( tid < size )
+    output[tid] = exclusive_scan_smem[tid];
+}
 
 void your_histogram_and_prefixsum(const float* const d_logLuminance,
                                   unsigned int* const d_cdf,
                                   float &min_logLum,
                                   float &max_logLum,
-                                  const size_t numRows,
-                                  const size_t numCols,
-                                  const size_t numBins)
+                                  size_t numRows,
+                                  size_t numCols,
+                                  size_t numBins)
 {
-  //TODO
-  /*Here are the steps you need to implement
-    1) find the minimum and maximum value in the input logLuminance channel
-       store in min_logLum and max_logLum
-    2) subtract them to find the range
-    3) generate a histogram of all the values in the logLuminance channel using
-       the formula: bin = (lum[i] - lumMin) / lumRange * numBins
-    4) Perform an exclusive scan (prefix sum) on the histogram to get
-       the cumulative distribution of luminance values (this should go in the
-       incoming d_cdf pointer which already has been allocated for you)       */
+  size_t luminance_size = numRows * numCols;
+  size_t num_threads = 1024;
+  size_t num_blocks = static_cast<size_t>(ceil(static_cast<float>(luminance_size)/static_cast<float>(num_threads)));
 
+  float *d_partial_reduce;
+  checkCudaErrors(cudaMalloc(&d_partial_reduce, sizeof(float) * num_blocks));
 
+  float *d_reduce_output;
+  checkCudaErrors(cudaMalloc(&d_reduce_output, sizeof(float)));
+
+  reduce_min<<<num_blocks,num_threads, num_threads* sizeof(float)>>>(d_logLuminance, luminance_size, d_partial_reduce);
+  reduce_min<<<1,num_blocks, num_blocks*sizeof(float)>>>(d_partial_reduce, num_blocks, d_reduce_output);
+  checkCudaErrors(cudaMemcpy(&min_logLum, d_reduce_output, sizeof(float), cudaMemcpyDeviceToHost));
+
+  reduce_max<<<num_blocks,num_threads, num_threads* sizeof(float)>>>(d_logLuminance, luminance_size, d_partial_reduce);
+  reduce_max<<<1,num_blocks, num_blocks*sizeof(float)>>>(d_partial_reduce, num_blocks, d_reduce_output);
+  checkCudaErrors(cudaMemcpy(&max_logLum, d_reduce_output, sizeof(float), cudaMemcpyDeviceToHost));
+
+  float range = max_logLum - min_logLum;
+
+  unsigned int *d_bins;
+  checkCudaErrors(cudaMalloc(&d_bins, numBins*sizeof(unsigned int)));
+  histogram<<<num_blocks, num_threads>>>(d_logLuminance, luminance_size, d_bins, numBins, min_logLum, range);
+  exclusive_scan_add<<<1, numBins, numBins * sizeof( unsigned int)>>>(d_bins, numBins, d_cdf);
 }

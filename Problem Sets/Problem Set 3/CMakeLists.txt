@@ -6,12 +6,17 @@
 ############################################################################
 # minimum required cmake version
 cmake_minimum_required(VERSION 2.8)
-find_package(CUDA QUIET REQUIRED)
 
 SET (compare_files compare.cpp)
+
+FIND_PACKAGE(CUDA REQUIRED)
+FIND_PACKAGE(OpenCV REQUIRED)
+INCLUDE(FindCUDA)
 
 file( GLOB  hdr *.hpp *.h )
 file( GLOB  cu  *.cu)
 SET (HW3_files main.cpp loadSaveImage.cpp reference_calc.cpp compare.cpp)
-    
+
+include_directories( ${OpenCV_INCLUDE_DIRS} )
 CUDA_ADD_EXECUTABLE(HW3 ${HW3_files} ${hdr} ${cu})
+target_link_libraries(HW3 ${OpenCV_LIBS})
